@@ -1,0 +1,104 @@
+name: Freshness Monitor
+
+# Daily check: if today's report files (en + zh) are missing, open an issue.
+#
+# Why: this archive is populated by `scripts/generate-report.mjs` running on a
+# server (systemd timer). Failures in that pipeline (auth, network, timer not
+# running) are silent — the source script logs but doesn't alert. This workflow
+# is the independent observer: if no file lands by 14:00 UTC (6h after the
+# nominal 08:00 UTC generation window), open an issue so the operator notices.
+
+on:
+  schedule:
+    # Daily at 14:00 UTC (gives the 08:00 UTC source job 6h of slack)
+    - cron: '0 14 * * *'
+  workflow_dispatch:  # allow manual run
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine today's expected files
+        id: paths
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          YEAR=$(date -u +%Y)
+          EN_PATH="en/${YEAR}/${TODAY}.md"
+          ZH_PATH="zh/${YEAR}/${TODAY}.md"
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          echo "en_path=$EN_PATH" >> "$GITHUB_OUTPUT"
+          echo "zh_path=$ZH_PATH" >> "$GITHUB_OUTPUT"
+          echo "Today (UTC): $TODAY"
+          echo "Expected EN: $EN_PATH"
+          echo "Expected ZH: $ZH_PATH"
+
+      - name: Check if today's reports exist
+        id: check
+        run: |
+          MISSING=()
+          [ -f "${{ steps.paths.outputs.en_path }}" ] || MISSING+=("${{ steps.paths.outputs.en_path }}")
+          [ -f "${{ steps.paths.outputs.zh_path }}" ] || MISSING+=("${{ steps.paths.outputs.zh_path }}")
+          if [ ${#MISSING[@]} -eq 0 ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+            echo "Both files present."
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            printf 'missing_list<<EOF\n%s\nEOF\n' "$(printf '%s\n' "${MISSING[@]}")" >> "$GITHUB_OUTPUT"
+            echo "Missing: ${MISSING[*]}"
+          fi
+
+      - name: Open issue if missing
+        if: steps.check.outputs.fresh == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = '${{ steps.paths.outputs.today }}'
+            const missing = `${{ steps.check.outputs.missing_list }}`
+            const title = `Missing report for ${today}`
+
+            // Avoid duplicate issues — only open one per day
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'freshness',
+            })
+            const dup = existing.find(i => i.title === title)
+            if (dup) {
+              core.info(`Issue already exists: #${dup.number}`)
+              return
+            }
+
+            const body = [
+              `Today's report (UTC ${today}) is missing from the archive as of the 14:00 UTC freshness check.`,
+              '',
+              '**Missing files:**',
+              '```',
+              missing,
+              '```',
+              '',
+              '**Likely causes** (check on the source server):',
+              '1. Source repo (`PRIVATE_finance_jeffliulab`) `scripts/generate-report.mjs` did not run today — verify systemd timer status:',
+              '   `systemctl --user status finance-report.timer` (or wherever the timer lives)',
+              '2. Script ran but `pushToArchive()` failed silently — check the script logs for `⚠️  Archive push failed`',
+              '3. Git push auth on the server expired — refresh the deploy key / token',
+              '4. Archive submodule on server was on detached HEAD — `git checkout main` in the submodule then re-run',
+              '',
+              '**Downstream impact**: the iOS app `Only What Matters` reads from this archive.',
+              'When today\'s report is missing the app falls back to the most recent stale one and shows a banner.',
+            ].join('\n')
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['freshness', 'automated'],
+            })
+            core.info(`Opened issue: ${title}`)
